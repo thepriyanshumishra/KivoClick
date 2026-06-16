@@ -428,7 +428,7 @@ struct KivoDynamicIslandView: View {
     // ── Model Picker ─────────────────────────────────────────────────────────
 
     private var modelPickerColumn: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             // Row 1 — Gemini models
             pickerRowHeader("Gemini")
             HStack(spacing: 4) {
@@ -449,7 +449,7 @@ struct KivoDynamicIslandView: View {
                 }
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
         .padding(.horizontal, 10)
     }
 
@@ -462,16 +462,20 @@ struct KivoDynamicIslandView: View {
 
     private func modelChip(model: AIModel, isOn: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 1) {
+            // Single-line layout: name · subtitle — keeps chip height compact (~18pt)
+            HStack(spacing: 4) {
                 Text(model.displayName)
                     .font(.system(size: 10.5, weight: isOn ? .semibold : .medium))
                     .foregroundColor(isOn ? .white : .white.opacity(0.50))
+                Text("·")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundColor(.white.opacity(0.18))
                 Text(model.subtitle)
                     .font(.system(size: 8.5, weight: .regular))
                     .foregroundColor(isOn ? accentColor.opacity(0.80) : .white.opacity(0.22))
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4)
             .background(chipBackground(isOn: isOn))
         }
         .buttonStyle(.plain)
@@ -482,7 +486,7 @@ struct KivoDynamicIslandView: View {
     // ── Voice Picker ─────────────────────────────────────────────────────────
 
     private var voicePickerColumn: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             // Row 1 — Gemini TTS voices
             pickerRowHeader("Gemini Voices")
             HStack(spacing: 4) {
@@ -503,31 +507,30 @@ struct KivoDynamicIslandView: View {
                 }
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 7)
         .padding(.horizontal, 10)
     }
 
     private func voiceChip(voice: AIVoice, isOn: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(voice.displayName)
-                        .font(.system(size: 10.5, weight: isOn ? .semibold : .medium))
-                        .foregroundColor(isOn ? .white : .white.opacity(0.50))
-                }
-                // Gender badge
+            // Single-line: name + gender badge inline — keeps chip height compact (~18pt)
+            HStack(spacing: 5) {
+                Text(voice.displayName)
+                    .font(.system(size: 10.5, weight: isOn ? .semibold : .medium))
+                    .foregroundColor(isOn ? .white : .white.opacity(0.50))
+                // Gender badge (M/F)
                 Text(voice.gender)
-                    .font(.system(size: 7.5, weight: .bold))
-                    .foregroundColor(isOn ? accentColor.opacity(0.80) : .white.opacity(0.20))
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundColor(isOn ? accentColor.opacity(0.85) : .white.opacity(0.22))
                     .padding(.horizontal, 3)
-                    .padding(.vertical, 1)
+                    .padding(.vertical, 1.5)
                     .background(
                         Capsule()
                             .fill(isOn ? accentColor.opacity(0.18) : Color.white.opacity(0.06))
                     )
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.vertical, 4)
             .background(chipBackground(isOn: isOn))
         }
         .buttonStyle(.plain)
