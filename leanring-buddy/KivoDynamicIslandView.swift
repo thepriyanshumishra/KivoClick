@@ -699,8 +699,19 @@ struct KivoDynamicIslandView: View {
 
     // MARK: - Settings Window
 
+    // Strong static reference so ARC doesn't destroy the NSWindow the
+    // moment openSettingsWindow() returns. Without this, the window is a
+    // local `let` with zero owners after the function exits → EXC_BAD_ACCESS.
+    private static var settingsWindowRef: NSWindow?
+
     private func openSettingsWindow() {
         showSettingsSheet = false
+
+        // If the window already exists and is on screen, just bring it forward.
+        if let existing = Self.settingsWindowRef, existing.isVisible {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
 
         let settingsView = KivoSettingsView()
         let hosting = NSHostingView(rootView: settingsView)
@@ -718,9 +729,13 @@ struct KivoDynamicIslandView: View {
         window.backgroundColor = NSColor(DS.Colors.surface1)
         window.contentView = hosting
         window.center()
-        window.makeKeyAndOrderFront(nil)
         window.level = .floating
+        window.makeKeyAndOrderFront(nil)
+
+        // Retain the window in the static so it lives until the app quits.
+        Self.settingsWindowRef = window
     }
+
 
     // MARK: - Animation Drivers
 
