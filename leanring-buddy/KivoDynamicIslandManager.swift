@@ -38,7 +38,7 @@ final class KivoDynamicIslandManager: NSObject {
     static let collapsedWidth: CGFloat  = 160
     static let collapsedHeight: CGFloat = 30
     static let expandedWidth: CGFloat   = 600
-    static let expandedHeight: CGFloat  = 130
+    static let expandedHeight: CGFloat  = 152
 
     // MARK: - State
     let islandState = IslandState()
