@@ -2,44 +2,76 @@
 //  ElevenLabsTTSClient.swift
 //  leanring-buddy
 //
-//  Routes TTS through the Cloudflare Worker proxy.
-//  Voices Hannah/Daniel → Orpheus (Groq), Aoede/Puck → Gemini TTS.
-//
-//  GAP FIX:
-//  The original code ran the entire URLSession fetch on @MainActor and
-//  never called prepareToPlay() — this caused 100-300ms gaps at the start
-//  of each audio segment because AVAudioPlayer had to initialise its audio
-//  hardware connection inline with the first play() call.
-//
-//  This version:
-//    1. Fetches audio data on a background Task (off main actor).
-//    2. Calls prepareToPlay() while still on the background thread so the
-//       audio hardware session is warm before we call play().
-//    3. Returns to @MainActor only to set the player and call play() — this
-//       is the minimum work needed on main and eliminates the gap.
-//    4. Removes the rate=0.88 slowdown (enableRate=true causes the DSP
-//       time-stretcher to initialise lazily on first play, adding jitter).
+//  Redirects TTS calls to local Kokoro TTS via SherpaOnnx.
 //
 
 import AVFoundation
 import Foundation
+import SherpaOnnx
 
 @MainActor
 final class ElevenLabsTTSClient: NSObject, AVAudioPlayerDelegate {
     private let proxyURL: String
     private var audioPlayer: AVAudioPlayer?
     private var isCurrentlySpeaking = false
+    private var ttsInstance: SherpaOnnxOfflineTtsWrapper?
+    var onPlaybackStateChanged: (@Sendable @MainActor (Bool) -> Void)?
 
     init(proxyURL: String) {
         self.proxyURL = proxyURL
         super.init()
     }
 
+    // MARK: - getOrInitTTS
+
+    /// Lazily initializes and returns the SherpaOnnx OfflineTts engine using local model files.
+    private func getOrInitTTS() throws -> SherpaOnnxOfflineTtsWrapper {
+        if let tts = ttsInstance {
+            return tts
+        }
+
+        let manager = KokoroTTSModelManager.shared
+        guard manager.isModelReady else {
+            throw NSError(
+                domain: "ElevenLabsTTSClient",
+                code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "Local voice model not ready. Please download it from settings first."]
+            )
+        }
+
+        // Configure Kokoro model paths
+        let kokoroConfig = sherpaOnnxOfflineTtsKokoroModelConfig(
+            model: manager.modelURL.path,
+            voices: manager.voicesURL.path,
+            tokens: manager.tokensURL.path,
+            dataDir: manager.espeakDataURL.path,
+            lengthScale: 1.0
+        )
+
+        let modelConfig = sherpaOnnxOfflineTtsModelConfig(
+            kokoro: kokoroConfig,
+            numThreads: 4,
+            debug: 0,
+            provider: "cpu"
+        )
+
+        var ttsConfig = sherpaOnnxOfflineTtsConfig(
+            model: modelConfig,
+            ruleFsts: ""
+        )
+
+        let tts = withUnsafePointer(to: &ttsConfig) { configPtr in
+            return SherpaOnnxOfflineTtsWrapper(config: configPtr)
+        }
+        
+        self.ttsInstance = tts
+        print("🔊 KokoroTTSClient: Initialized SherpaOnnx OfflineTtsWrapper successfully.")
+        return tts
+    }
+
     // MARK: - speakText
 
-    /// Fetches PCM audio from the worker proxy and plays it immediately with
-    /// minimal gap. The heavy work (network fetch + WAV wrapping +
-    /// prepareToPlay) happens off the main actor so UI stays responsive.
+    /// Synthesizes speech locally using Kokoro TTS and plays it immediately with minimal gap.
     func speakText(_ text: String, voice: String) async throws {
         stopPlayback()
 
@@ -50,73 +82,94 @@ final class ElevenLabsTTSClient: NSObject, AVAudioPlayerDelegate {
         guard !cleanedText.isEmpty else { return }
 
         do {
-            // ── Step 1: Build the request on MainActor (fast — no I/O) ────────
-            guard let url = URL(string: proxyURL) else {
-                throw NSError(
-                    domain: "ElevenLabsTTSClient", code: 400,
-                    userInfo: [NSLocalizedDescriptionKey: "Invalid proxy URL"]
-                )
+            // Get/Init the local TTS engine
+            let tts = try getOrInitTTS()
+
+            // Map selected voice name to Kokoro speaker ID (sid)
+            let voiceLower = voice.lowercased()
+            let sid: Int
+            if voiceLower == "aoede" {
+                sid = 7 // af_aoede
+            } else if voiceLower == "puck" {
+                sid = 10 // pm_alex
+            } else if voiceLower == "hannah" {
+                sid = 1 // af_bella
+            } else if voiceLower == "daniel" {
+                sid = 11 // pm_santa
+            } else {
+                sid = 7 // Default fallback to af_aoede
             }
 
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let jsonPayload = ["text": cleanedText, "voice": voice]
-            request.httpBody = try JSONSerialization.data(withJSONObject: jsonPayload)
+            print("🔊 Local Kokoro TTS: Synthesizing (\(voice) -> sid: \(sid)). Text: \"\(cleanedText)\"")
 
-            print("🔊 Requesting TTS (\(voice)) from proxy. Text length: \(cleanedText.count) chars")
-
-            // ── Step 2: Fetch + wrap + prepare — all OFF main actor ───────────
-            // Suspension point here releases @MainActor so SwiftUI/AppKit
-            // can continue rendering cursor animations while we wait for
-            // the network response. This is the main fix for the gaps.
+            // Perform synthesis and WAV wrapping off the main actor
             let player: AVAudioPlayer = try await Task.detached(priority: .userInitiated) {
-                let (data, response) = try await URLSession.shared.data(for: request)
+                // Generate audio samples (Float array) using speed setting from UserDefaults
+                let speedVal = UserDefaults.standard.double(forKey: "kivoVoiceSpeed")
+                let finalSpeed = speedVal > 0.1 ? Float(speedVal) : 1.0
+                let audio = tts.generate(text: cleanedText, sid: sid, speed: finalSpeed)
+                let samples = audio.samples
+                let sampleRate = audio.sampleRate
 
-                guard let httpResponse = response as? HTTPURLResponse,
-                      httpResponse.statusCode == 200 else {
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    let errorMsg = String(data: data, encoding: .utf8) ?? "Unknown error"
-                    print("⚠️ TTS proxy error (status \(status)): \(errorMsg)")
-                    throw NSError(
-                        domain: "ElevenLabsTTSClient", code: status,
-                        userInfo: [NSLocalizedDescriptionKey: errorMsg]
-                    )
+                // Convert Float samples to Int16 PCM data
+                var pcmData = Data(capacity: samples.count * 2)
+                for sample in samples {
+                    let clamped = max(-1.0, min(1.0, sample))
+                    let intVal = Int16(clamped * 32767.0)
+                    withUnsafeBytes(of: intVal.littleEndian) { pcmData.append(contentsOf: $0) }
                 }
 
-                // Both Gemini and Orpheus routes return raw PCM16 mono.
-                // Gemini TTS: 24 kHz — Orpheus (Groq): 24 kHz.
+                // Wrap PCM data in WAV header
                 let wavData = BuddyWAVFileBuilder.buildWAVData(
-                    fromPCM16MonoAudio: data,
-                    sampleRate: 24000
+                    fromPCM16MonoAudio: pcmData,
+                    sampleRate: Int(sampleRate)
                 )
 
                 let audioPlayer = try AVAudioPlayer(data: wavData)
-                // Pre-warm the audio hardware connection NOW, before we
-                // return to the main actor. This eliminates the startup gap
-                // that occurred when play() had to do this work inline.
                 audioPlayer.prepareToPlay()
                 return audioPlayer
-
             }.value
 
-            // ── Step 3: Hand off to main actor — set delegate and press play ──
-            // At this point prepareToPlay() is done; play() is near-instant.
+            // Hand off to main actor for playback
             player.delegate = self
             audioPlayer = player
             isCurrentlySpeaking = true
             player.play()
-            print("🔊 Playing synthesized audio via AVAudioPlayer (duration: \(String(format: "%.2f", player.duration))s)")
+            onPlaybackStateChanged?(true)
+            print("🔊 Local Kokoro TTS: Playing synthesized audio (duration: \(String(format: "%.2f", player.duration))s)")
 
         } catch {
-            print("⚠️ TTS playback failed: \(error.localizedDescription). Attempting premium fallback...")
+            print("⚠️ Local Kokoro TTS playback failed: \(error.localizedDescription). Attempting fallback...")
             try await playFallbackErrorAudio(voice: voice, error: error)
+        }
+    }
+
+    /// Plays a pre-bundled voice sample for preview purposes in settings.
+    func playSample(for voice: String) {
+        stopPlayback()
+        let voiceLower = voice.lowercased()
+        let assetName = "general_error_\(voiceLower)"
+        guard let assetURL = Bundle.main.url(forResource: assetName, withExtension: "wav") else {
+            print("⚠️ Sample audio \(assetName).wav not found")
+            return
+        }
+        do {
+            let player = try AVAudioPlayer(contentsOf: assetURL)
+            player.delegate = self
+            player.prepareToPlay()
+            self.audioPlayer = player
+            self.isCurrentlySpeaking = true
+            player.play()
+            onPlaybackStateChanged?(true)
+            print("🔊 Local Voice Preview: Playing sample \(assetName).wav")
+        } catch {
+            print("⚠️ Failed to play voice sample: \(error.localizedDescription)")
         }
     }
 
     // MARK: - Fallback Error Audio
 
-    /// Plays a locally bundled error audio clip when TTS fetch fails.
+    /// Plays a locally bundled error audio clip when TTS fails.
     private func playFallbackErrorAudio(voice: String, error: Error) async throws {
         let voiceLower = voice.lowercased()
         let voiceSuffix: String
@@ -165,31 +218,27 @@ final class ElevenLabsTTSClient: NSObject, AVAudioPlayerDelegate {
 
     // MARK: - Playback State
 
-    /// Whether audio is currently playing back.
     var isPlaying: Bool {
         isCurrentlySpeaking && (audioPlayer?.isPlaying ?? false)
     }
 
-    /// Elapsed playback time of the current audio clip.
     var currentTime: TimeInterval {
         audioPlayer?.currentTime ?? 0
     }
 
-    /// Total duration of the current audio clip.
     var duration: TimeInterval {
         audioPlayer?.duration ?? 0
     }
 
-    /// Current playback rate (1.0 = normal speed).
     var rate: Float {
         audioPlayer?.rate ?? 1.0
     }
 
-    /// Stops speech immediately and resets state.
     func stopPlayback() {
         audioPlayer?.stop()
         audioPlayer = nil
         isCurrentlySpeaking = false
+        onPlaybackStateChanged?(false)
     }
 
     // MARK: - AVAudioPlayerDelegate
@@ -197,6 +246,7 @@ final class ElevenLabsTTSClient: NSObject, AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
             isCurrentlySpeaking = false
+            onPlaybackStateChanged?(false)
         }
     }
 
@@ -206,6 +256,7 @@ final class ElevenLabsTTSClient: NSObject, AVAudioPlayerDelegate {
         }
         Task { @MainActor in
             isCurrentlySpeaking = false
+            onPlaybackStateChanged?(false)
         }
     }
 }

@@ -95,8 +95,10 @@ class ElementSearchLocator {
         
         // A) Search the menu bar first if it exists
         var menuBarVal: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appRef, kAXMenuBarAttribute as CFString, &menuBarVal) == .success {
-            let menuBar = menuBarVal as! AXUIElement
+        if AXUIElementCopyAttributeValue(appRef, kAXMenuBarAttribute as CFString, &menuBarVal) == .success,
+           let menuBarObject = menuBarVal,
+           CFGetTypeID(menuBarObject) == AXUIElementGetTypeID() {
+            let menuBar = menuBarObject as! AXUIElement
             if let element = searchElementTree(menuBar, query: query, currentDepth: 0, maxDepth: maxDepth, visitedCount: &visitedCount, maxVisited: maxVisited) {
                 if let frame = getElementAppKitFrame(element, primaryHeight: primaryHeight) {
                     let center = CGPoint(x: frame.midX, y: frame.midY)
@@ -171,10 +173,17 @@ class ElementSearchLocator {
                            AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeVal) == .success {
                             var point = CGPoint.zero
                             var size = CGSize.zero
-                            if AXValueGetValue(posVal as! AXValue, .cgPoint, &point),
-                               AXValueGetValue(sizeVal as! AXValue, .cgSize, &size) {
-                                if size.width > 1.0 && size.height > 1.0 {
-                                    return element
+                            if let posValObj = posVal,
+                               let sizeValObj = sizeVal,
+                               CFGetTypeID(posValObj) == AXValueGetTypeID(),
+                               CFGetTypeID(sizeValObj) == AXValueGetTypeID() {
+                                let posValue = posValObj as! AXValue
+                                let sizeValue = sizeValObj as! AXValue
+                                if AXValueGetValue(posValue, .cgPoint, &point),
+                                   AXValueGetValue(sizeValue, .cgSize, &size) {
+                                    if size.width > 1.0 && size.height > 1.0 {
+                                        return element
+                                    }
                                 }
                             }
                         }
@@ -220,8 +229,16 @@ class ElementSearchLocator {
         var point = CGPoint.zero
         var size = CGSize.zero
         
-        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &point),
-              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else {
+        guard let positionValObj = positionValue,
+              let sizeValObj = sizeValue,
+              CFGetTypeID(positionValObj) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValObj) == AXValueGetTypeID() else {
+            return nil
+        }
+        let positionVal = positionValObj as! AXValue
+        let sizeVal = sizeValObj as! AXValue
+        guard AXValueGetValue(positionVal, .cgPoint, &point),
+              AXValueGetValue(sizeVal, .cgSize, &size) else {
             return nil
         }
         

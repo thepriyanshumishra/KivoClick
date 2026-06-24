@@ -31,6 +31,9 @@ final class SherpaOnnxModelManager: ObservableObject {
     /// True once the WhisperKit instance is loaded and ready to transcribe.
     @Published var isModelReady: Bool = false
 
+    /// True while checking the cache on startup.
+    @Published var isCheckingCache: Bool = true
+
     /// Non-nil if the download or initialization failed.
     @Published var downloadError: String? = nil
 
@@ -68,6 +71,7 @@ final class SherpaOnnxModelManager: ObservableObject {
 
         downloadError = nil
         downloadProgress = 0.0
+        isCheckingCache = false
 
         do {
             print("📦 WhisperKit: Starting model download/load for \(Self.whisperModelVariant)")
@@ -109,6 +113,10 @@ final class SherpaOnnxModelManager: ObservableObject {
     /// immediately without requiring the user to tap "Download" again.
     @MainActor
     private func silentlyLoadFromCacheIfAvailable() async {
+        isCheckingCache = true
+        defer {
+            isCheckingCache = false
+        }
         do {
             // WhisperKit.download with no progress callback — returns instantly from cache
             // if model files are present, or throws if not cached.

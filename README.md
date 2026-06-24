@@ -9,11 +9,22 @@ Built with SwiftUI and AppKit bridging, Kivo Click is designed to be native, min
 ## 🏝️ The Kivo Dynamic Island UI
 
 Kivo Click replaces the legacy menu bar status dropdowns with a stunning notch-style floating panel:
-* **Collapsed State (Pill)**: A thin, iPhone-style pill centered at the top of your screen, displaying a breathing Kivo icon and a live, state-aware status dot (green for listening, amber for thinking, blue for speaking/responding).
-* **Expanded State (Panel)**: Expands smoothly on hover (with spring animations and automatic anti-flicker debouncing) to show a tabbed selector:
-  * **Kivo Tab**: Displays push-to-talk guidelines, a horizontal model picker, and a voice picker.
-  * **Agent Tab**: A background execution area for agentic tasks (like building apps in the background).
-  * **Footer**: Quick permissions indicators, Advanced Settings (coming soon), and Quit buttons.
+* **Collapsed State (Pill)**: A true Apple Squircle (`.continuous` corner style) centered at the top of your screen, featuring a `0.5px` active cursor-matched ambient glow that dynamically updates color based on the selected pointer color.
+* **Expanded State (Panel)**: Expands smoothly on hover (with a responsive `100ms` expand delay and `250ms` collapse delay using a single-stage `.spring(response: 0.35, dampingFraction: 0.82)` animation) to show a tabbed selector:
+  * **Home Tab**: Displays push-to-talk guidelines, dynamic color swatches that pulse on hover, a media player widget, and voice settings.
+  * **Agent Tab**: Frosted glass task cards showing active agent tasks with rotating status borders and inline checklists.
+* **Liquid Bezel & Bezel Highlight**: An animatable bottom edge bulge simulates liquid droplet physics when expanding. Background is styled with deep glassmorphism (dark background at `0.92` opacity, `20px` blur, and white `0.10` opacity inner top-edge bezel highlight).
+
+---
+
+## ✨ Premium UI/UX Features
+
+* **Organic Squircle & Liquid Physics**: Utilizes custom SwiftUI shapes with continuous corner styling and dynamic bulges mimicking liquid glass droplet expansion.
+* **Tactile Speed Slider**: Voice speed settings render a custom slider with a floating blue speed bubble tooltip (e.g. `1.2x`) that pops up and tracks the thumb during drag.
+* **iOS-Style Sliding Navigation**: Transitioning settings sub-menus uses asymmetrical lateral slide-ins and opacity cross-fades rather than instant jumps.
+* **Liquid Floating Status Orbs**: The active agent status orbs are shaped like liquid droplets that bob and morph (sin/cos deformation) on screen.
+* **Orb Burst Animations**: Completing a task triggers a spring-bounce scaling effect on the orb, followed by a radial particle explosion before auto-dismissal.
+* **Dynamic Startup Cache Detection**: Automatically checks HuggingFace local caches silently on launch without showing mock missing warning banners, dynamically adjusting window heights.
 
 ---
 

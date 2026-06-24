@@ -33,14 +33,26 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     /// The Dynamic Island floating panel — the app's sole visible UI element.
     private var dynamicIslandManager: KivoDynamicIslandManager?
 
+    /// The top-right floating agent orb stack — appears when agents are running.
+    /// Retained here so it lives for the app's lifetime. Created after companionManager.start()
+    /// so AgentManager.shared is already stable when the panel subscribes to it.
+    private var floatingAgentOrbsManager: FloatingAgentOrbsManager?
+
     private let companionManager = CompanionManager()
     private var sparkleUpdaterController: SPUStandardUpdaterController?
+
+    #if DEBUG
+    private var wranglerProcess: Process?
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("🎯 Kivo Click: Starting…")
         print("🎯 Kivo Click: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
-        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
+        UserDefaults.standard.register(defaults: [
+            "NSInitialToolTipDelay": 0,
+            "showInDock": true
+        ])
 
         ClickyAnalytics.configure()
         ClickyAnalytics.trackAppOpened()
@@ -50,15 +62,25 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         companionManager.start()
 
         // Create the Dynamic Island panel — it appears immediately at top-center.
-        // No showPanelOnLaunch call needed; the island is always visible.
         dynamicIslandManager = KivoDynamicIslandManager(companionManager: companionManager)
+
+        // Create the top-right floating agent orb panel — hidden until first agent starts.
+        floatingAgentOrbsManager = FloatingAgentOrbsManager(agentManager: AgentManager.shared)
 
         registerAsLoginItemIfNeeded()
         // startSparkleUpdater()
+
+        #if DEBUG
+        startWranglerBackendIfNeeded()
+        #endif
     }
+
 
     func applicationWillTerminate(_ notification: Notification) {
         companionManager.stop()
+        #if DEBUG
+        stopWranglerBackend()
+        #endif
     }
 
     /// Registers the app as a login item so it launches automatically on
@@ -90,4 +112,34 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
             print("⚠️ Kivo Click: Sparkle updater failed to start: \(error)")
         }
     }
+
+    #if DEBUG
+    private func startWranglerBackendIfNeeded() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["npx", "wrangler", "dev"]
+        
+        let sourceFilePath = #filePath
+        let fileURL = URL(fileURLWithPath: sourceFilePath)
+        let projectRootURL = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        let workerURL = projectRootURL.appendingPathComponent("worker")
+        
+        process.currentDirectoryURL = workerURL
+        
+        do {
+            try process.run()
+            self.wranglerProcess = process
+            print("🎯 Kivo Click: Started local Wrangler dev server in background at \(workerURL.path)")
+        } catch {
+            print("⚠️ Kivo Click: Failed to launch local Wrangler dev server: \(error)")
+        }
+    }
+    
+    private func stopWranglerBackend() {
+        if let process = wranglerProcess, process.isRunning {
+            process.terminate()
+            print("🎯 Kivo Click: Terminated local Wrangler dev server")
+        }
+    }
+    #endif
 }

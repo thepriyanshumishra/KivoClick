@@ -89,7 +89,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Onboarding Music
 
     private var onboardingMusicPlayer: AVAudioPlayer?
-    private var onboardingMusicFadeTimer: Timer?
+    private var onboardingMusicFadeTask: Task<Void, Never>?
 
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
@@ -99,14 +99,22 @@ final class CompanionManager: ObservableObject {
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "http://localhost:8787"
+    private static var workerBaseURL: String {
+        return AppBundleConfiguration.workerProxyURL
+    }
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
 
+    @Published var isPlaying: Bool = false
+
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        let client = ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        client.onPlaybackStateChanged = { [weak self] isPlaying in
+            self?.isPlaying = isPlaying
+        }
+        return client
     }()
 
     /// Conversation history so Claude remembers prior exchanges within a session.
@@ -126,7 +134,7 @@ final class CompanionManager: ObservableObject {
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
 
-    private var playbackTimelineTimer: Timer?
+    private var playbackTimelineTimerTask: Task<Void, Never>?
     private var globalClickMonitor: Any?
     private var localClickMonitor: Any?
     private var shouldWaitForClickAfterSpeech = false
@@ -166,7 +174,27 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(voice, forKey: "selectedVoice")
     }
 
-    /// User preference for whether the Clicky cursor should be shown.
+    func playVoiceSample(for voice: String) {
+        elevenLabsTTSClient.playSample(for: voice)
+    }
+
+    func stopVoiceSample() {
+        elevenLabsTTSClient.stopPlayback()
+    }
+
+    /// Updates the Kivo cursor overlay color immediately. The chosen color is
+    /// persisted by the caller via @AppStorage("kivoCursorColorId").
+    /// We post a notification so OverlayWindow can react without a hard dependency.
+    func setCursorOverlayColor(_ newColor: SwiftUI.Color) {
+        NotificationCenter.default.post(
+            name: .kivoCursorColorDidChange,
+            object: nil,
+            userInfo: ["color": newColor]
+        )
+    }
+
+
+    /// User preference for whether the Kivo Click cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
     /// Persisted to UserDefaults so the choice survives app restarts.
     @Published var isClickyCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isClickyCursorEnabled") == nil
@@ -224,7 +252,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        print("🔑 Kivo Click start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
@@ -281,8 +309,8 @@ final class CompanionManager: ObservableObject {
     }
 
     private func stopOnboardingMusic() {
-        onboardingMusicFadeTimer?.invalidate()
-        onboardingMusicFadeTimer = nil
+        onboardingMusicFadeTask?.cancel()
+        onboardingMusicFadeTask = nil
         onboardingMusicPlayer?.stop()
         onboardingMusicPlayer = nil
     }
@@ -290,7 +318,7 @@ final class CompanionManager: ObservableObject {
     private func startOnboardingMusic() {
         stopOnboardingMusic()
         guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
+            print("⚠️ Kivo Click: ff.mp3 not found in bundle")
             return
         }
 
@@ -301,11 +329,13 @@ final class CompanionManager: ObservableObject {
             self.onboardingMusicPlayer = player
 
             // After 1m 30s, fade the music out over 3s
-            onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
+            onboardingMusicFadeTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 90_000_000_000)
+                guard !Task.isCancelled else { return }
                 self?.fadeOutOnboardingMusic()
             }
         } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
+            print("⚠️ Kivo Click: Failed to play onboarding music: \(error)")
         }
     }
 
@@ -316,18 +346,21 @@ final class CompanionManager: ObservableObject {
         let fadeDuration: Double = 3.0
         let stepInterval = fadeDuration / Double(fadeSteps)
         let volumeDecrement = player.volume / Float(fadeSteps)
-        var stepsRemaining = fadeSteps
 
-        onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] timer in
-            stepsRemaining -= 1
-            player.volume -= volumeDecrement
-
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.stop()
-                self?.onboardingMusicPlayer = nil
-                self?.onboardingMusicFadeTimer = nil
+        onboardingMusicFadeTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            for _ in 0..<fadeSteps {
+                guard !Task.isCancelled else { break }
+                try? await Task.sleep(nanoseconds: UInt64(stepInterval * 1_000_000_000))
+                guard !Task.isCancelled else { break }
+                guard self.onboardingMusicPlayer === player else { break }
+                player.volume -= volumeDecrement
             }
+            if !Task.isCancelled, self.onboardingMusicPlayer === player {
+                player.stop()
+                self.onboardingMusicPlayer = nil
+            }
+            self.onboardingMusicFadeTask = nil
         }
     }
 
@@ -344,8 +377,8 @@ final class CompanionManager: ObservableObject {
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
 
-        playbackTimelineTimer?.invalidate()
-        playbackTimelineTimer = nil
+        playbackTimelineTimerTask?.cancel()
+        playbackTimelineTimerTask = nil
         stopWaitingForClick()
 
         currentResponseTask?.cancel()
@@ -457,7 +490,7 @@ final class CompanionManager: ObservableObject {
     private func promptForMicrophoneIfNotDetermined() {
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined else { return }
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 self?.hasMicrophonePermission = granted
             }
         }
@@ -468,7 +501,7 @@ final class CompanionManager: ObservableObject {
     /// macOS requires an app restart for that one to take effect.
     private func startPermissionPolling() {
         accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 self?.refreshAllPermissions()
             }
         }
@@ -532,6 +565,15 @@ final class CompanionManager: ObservableObject {
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
+            // Ensure local models are ready before recording can occur
+            let isTTSReady = KokoroTTSModelManager.shared.isModelReady
+            let isSTTReady = SherpaOnnxModelManager.shared.isModelReady
+            if !isTTSReady || !isSTTReady {
+                KivoSoundFeedback.playOrbTap()
+                NotificationCenter.default.post(name: Notification.Name("kivoIslandRequestExpand"), object: nil)
+                return
+            }
+
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
@@ -549,8 +591,8 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
-            playbackTimelineTimer?.invalidate()
-            playbackTimelineTimer = nil
+            playbackTimelineTimerTask?.cancel()
+            playbackTimelineTimerTask = nil
             stopWaitingForClick()
             clearDetectedElementLocation()
 
@@ -709,8 +751,8 @@ final class CompanionManager: ObservableObject {
         transcriptUsed: String,
         screenCaptures: [CompanionScreenCapture]
     ) async {
-        playbackTimelineTimer?.invalidate()
-        playbackTimelineTimer = nil
+        playbackTimelineTimerTask?.cancel()
+        playbackTimelineTimerTask = nil
         currentPointingTarget = nil
         stopWaitingForClick()
 
@@ -884,52 +926,45 @@ final class CompanionManager: ObservableObject {
                     ))
                 }
 
-                playbackTimelineTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] timer in
-                    guard let self = self else {
-                        timer.invalidate()
-                        return
-                    }
+                playbackTimelineTimerTask = Task { @MainActor in
+                    var queue = activeTargetsQueue
+                    while self.elevenLabsTTSClient.isPlaying {
+                        try? await Task.sleep(nanoseconds: 50_000_000) // 0.05s
+                        guard !Task.isCancelled else { return }
 
-                    guard self.elevenLabsTTSClient.isPlaying else {
-                        timer.invalidate()
-                        self.playbackTimelineTimer = nil
-                        
-                        // Wait 0.8 seconds after speech finishes, then clear target
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                            guard let self = self else { return }
-                            if self.voiceState == .responding && !self.elevenLabsTTSClient.isPlaying {
-                                self.currentPointingTarget = nil
-                                if self.shouldWaitForClickAfterSpeech {
-                                    self.startWaitingForClick()
-                                } else {
-                                    self.voiceState = .idle
-                                    self.scheduleTransientHideIfNeeded()
-                                }
+                        let currentTime = self.elevenLabsTTSClient.currentTime
+                        var remainingTargets: [TriggerableTarget] = []
+                        for target in queue {
+                            if currentTime >= target.triggerTime {
+                                let pointingTarget = PointingTarget(
+                                    id: UUID(),
+                                    screenLocation: target.screenLocation,
+                                    displayFrame: target.displayFrame,
+                                    label: target.label,
+                                    isFinal: target.isFinal
+                                )
+                                self.currentPointingTarget = pointingTarget
+                                ClickyAnalytics.trackElementPointed(elementLabel: target.label)
+                                print("🎯 Playback Timeline Triggered: Pointing at \"\(target.label)\" at \(currentTime)s (target offset \(target.triggerTime)s)")
+                            } else {
+                                remainingTargets.append(target)
                             }
                         }
-                        return
+                        queue = remainingTargets
                     }
 
-                    let currentTime = self.elevenLabsTTSClient.currentTime
-
-                    var remainingTargets: [TriggerableTarget] = []
-                    for target in activeTargetsQueue {
-                        if currentTime >= target.triggerTime {
-                            let pointingTarget = PointingTarget(
-                                id: UUID(),
-                                screenLocation: target.screenLocation,
-                                displayFrame: target.displayFrame,
-                                label: target.label,
-                                isFinal: target.isFinal
-                            )
-                            self.currentPointingTarget = pointingTarget
-                            ClickyAnalytics.trackElementPointed(elementLabel: target.label)
-                            print("🎯 Playback Timeline Triggered: Pointing at \"\(target.label)\" at \(currentTime)s (target offset \(target.triggerTime)s)")
+                    // Wait 0.8 seconds after speech finishes, then clear target
+                    try? await Task.sleep(nanoseconds: 800_000_000) // 0.8s
+                    guard !Task.isCancelled else { return }
+                    if self.voiceState == .responding && !self.elevenLabsTTSClient.isPlaying {
+                        self.currentPointingTarget = nil
+                        if self.shouldWaitForClickAfterSpeech {
+                            self.startWaitingForClick()
                         } else {
-                            remainingTargets.append(target)
+                            self.voiceState = .idle
+                            self.scheduleTransientHideIfNeeded()
                         }
                     }
-                    activeTargetsQueue = remainingTargets
                 }
             } catch {
                 ClickyAnalytics.trackTTSError(error: error.localizedDescription)
@@ -1061,7 +1096,7 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// If the cursor is in transient mode (user toggled "Show Clicky" off),
+    /// If the cursor is in transient mode (user toggled "Show Kivo Click" off),
     /// waits for TTS playback and any pointing animation to finish, then
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
@@ -1317,6 +1352,9 @@ final class CompanionManager: ObservableObject {
     func setupOnboardingVideo() {
         guard let videoURL = URL(string: "https://stream.mux.com/e5jB8UuSrtFABVnTHCR7k3sIsmcUHCyhtLu1tzqLlfs.m3u8") else { return }
 
+        // Clean up any existing video player and observers first to prevent leaks
+        tearDownOnboardingVideo()
+
         let player = AVPlayer(url: videoURL)
         player.isMuted = false
         player.volume = 0.0
@@ -1330,21 +1368,24 @@ final class CompanionManager: ObservableObject {
 
         // Wait for SwiftUI to mount the view, then set opacity to 1.
         // The .animation modifier on the view handles the actual animation.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000) // 0.2s
             self.onboardingVideoOpacity = 1.0
             // Fade audio volume from 0 → 1 over 2s to match visual fade
             self.fadeInVideoAudio(player: player, targetVolume: 1.0, duration: 2.0)
         }
 
         // At 40 seconds into the video, trigger the onboarding demo where
-        // Clicky flies to something interesting on screen and comments on it
+        // Kivo Click flies to something interesting on screen and comments on it
         let demoTriggerTime = CMTime(seconds: 40, preferredTimescale: 600)
         onboardingDemoTimeObserver = player.addBoundaryTimeObserver(
             forTimes: [NSValue(time: demoTriggerTime)],
             queue: .main
         ) { [weak self] in
-            ClickyAnalytics.trackOnboardingDemoTriggered()
-            self?.performOnboardingDemoInteraction()
+            Task { @MainActor in
+                ClickyAnalytics.trackOnboardingDemoTriggered()
+                self?.performOnboardingDemoInteraction()
+            }
         }
 
         // Fade out and clean up when the video finishes
@@ -1353,16 +1394,18 @@ final class CompanionManager: ObservableObject {
             object: player.currentItem,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            ClickyAnalytics.trackOnboardingVideoCompleted()
-            self.onboardingVideoOpacity = 0.0
-            // Wait for the 2s fade-out animation to complete before tearing down
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            Task { @MainActor in
+                guard let self = self else { return }
+                ClickyAnalytics.trackOnboardingVideoCompleted()
+                self.onboardingVideoOpacity = 0.0
+                // Wait for the 2s fade-out animation to complete before tearing down
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2.0 seconds
+                guard !Task.isCancelled else { return }
                 self.tearDownOnboardingVideo()
                 // After the video disappears, stream in the prompt to try talking
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    self.startOnboardingPromptStream()
-                }
+                try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+                guard !Task.isCancelled else { return }
+                self.startOnboardingPromptStream()
             }
         }
     }
@@ -1391,26 +1434,23 @@ final class CompanionManager: ObservableObject {
             onboardingPromptOpacity = 1.0
         }
 
-        var currentIndex = 0
-        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { timer in
-            guard currentIndex < message.count else {
-                timer.invalidate()
-                // Auto-dismiss after 10 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
-                    guard self.showOnboardingPrompt else { return }
-                    withAnimation(.easeOut(duration: 0.3)) {
-                        self.onboardingPromptOpacity = 0.0
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                        self.showOnboardingPrompt = false
-                        self.onboardingPromptText = ""
-                    }
-                }
-                return
+        Task { @MainActor in
+            for char in message {
+                try? await Task.sleep(nanoseconds: 30_000_000) // 0.03 seconds
+                guard showOnboardingPrompt else { return }
+                onboardingPromptText.append(char)
             }
-            let index = message.index(message.startIndex, offsetBy: currentIndex)
-            self.onboardingPromptText.append(message[index])
-            currentIndex += 1
+            
+            // Auto-dismiss after 10 seconds
+            try? await Task.sleep(nanoseconds: 10_000_000_000) // 10.0 seconds
+            guard showOnboardingPrompt else { return }
+            withAnimation(.easeOut(duration: 0.3)) {
+                onboardingPromptOpacity = 0.0
+            }
+            try? await Task.sleep(nanoseconds: 350_000_000) // 0.35 seconds
+            guard showOnboardingPrompt else { return }
+            showOnboardingPrompt = false
+            onboardingPromptText = ""
         }
     }
 
@@ -1420,16 +1460,13 @@ final class CompanionManager: ObservableObject {
         let steps = 20
         let stepInterval = duration / Double(steps)
         let volumeIncrement = (targetVolume - player.volume) / Float(steps)
-        var stepsRemaining = steps
 
-        Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { timer in
-            stepsRemaining -= 1
-            player.volume += volumeIncrement
-
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.volume = targetVolume
+        Task { @MainActor in
+            for _ in 0..<steps {
+                try? await Task.sleep(nanoseconds: UInt64(stepInterval * 1_000_000_000))
+                player.volume += volumeIncrement
             }
+            player.volume = targetVolume
         }
     }
 

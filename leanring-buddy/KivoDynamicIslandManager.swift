@@ -2,21 +2,15 @@
 //  KivoDynamicIslandManager.swift
 //  leanring-buddy
 //
-//  Dynamic Island panel controller.
+//  Manages the status-bar Dynamic Island panel.
+//  It expands on hover (with a 0.8s delay) or on click (instantly),
+//  and collapses when the mouse leaves.
 //
-//  KEY FIX — Hover Loop Prevention:
-//  The tracking area covers only the COLLAPSED pill region when collapsed.
-//  When the panel EXPANDS, the window grows downward, but we do NOT call
-//  updateTrackingAreas again during the resize, avoiding the
-//  mouseEntered→expand→resize→mouseExited→collapse→resize→mouseEntered loop.
-//
-//  HOW IT WORKS:
-//    1. The hosting view has a FIXED tracking rect equal to the FULL expanded
-//       frame from the start (maxSize). This never changes — no loop.
-//    2. expand() / collapse() guard with `isTransitioning` so they cannot
-//       fire simultaneously.
-//    3. collapse() debounces with 0.15s and also verifies mouse is actually
-//       outside before proceeding.
+//  KEY BEHAVIOURS:
+//    • Sized dynamically: Collapsed pill at top-center, expanding downward
+//      into the detail panel (or even further down for settings).
+//    • Sits on the primary screen at the top-center.
+//    • Fully rounded corner styling.
 //
 
 import AppKit
@@ -25,8 +19,18 @@ import SwiftUI
 
 // MARK: - IslandState
 
+enum SettingsSubScreen: Equatable {
+    case main
+    case voice
+    case shortcuts
+}
+
 final class IslandState: ObservableObject {
     @Published var isExpanded: Bool = false
+    @Published var isShowingSettings: Bool = false
+    @Published var isUndocked: Bool = false
+    @Published var selectedTab: IslandTab = .home
+    @Published var currentSettingsScreen: SettingsSubScreen = .main
 }
 
 // MARK: - KivoDynamicIslandManager
@@ -35,10 +39,11 @@ final class IslandState: ObservableObject {
 final class KivoDynamicIslandManager: NSObject {
 
     // MARK: - Sizes
-    static let collapsedWidth: CGFloat  = 160
-    static let collapsedHeight: CGFloat = 30
-    static let expandedWidth: CGFloat   = 600
-    static let expandedHeight: CGFloat  = 164
+    static let collapsedWidth: CGFloat  = 200
+    static let collapsedHeight: CGFloat = 24
+    static let expandedWidth: CGFloat   = 560
+    static let expandedHeight: CGFloat  = 270
+    static let settingsHeight: CGFloat  = 480
 
     // MARK: - State
     let islandState = IslandState()
@@ -46,15 +51,209 @@ final class KivoDynamicIslandManager: NSObject {
     private var islandPanel: NSPanel?
 
     // Prevents simultaneous expand/collapse calls from fighting each other
-    // (the root cause of the resize → tracking area → loop bug).
     private var isTransitioning: Bool = false
-    private var collapseWorkItem: DispatchWorkItem?
+
+    // Task-based delays (using structured concurrency)
+    private var expandTask: Task<Void, Never>?
+    private var collapseTask: Task<Void, Never>?
+    private let expandDelay: UInt64 = 100_000_000 // 100ms in nanoseconds
+    private let collapseDelay: UInt64 = 250_000_000 // 250ms in nanoseconds
 
     // MARK: - Init
     init(companionManager: CompanionManager) {
         self.companionManager = companionManager
         super.init()
         createIslandPanel()
+
+        // Observe collapse request notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCollapseNotification),
+            name: .kivoIslandShouldCollapse,
+            object: nil
+        )
+
+        // Observe settings state changed notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSettingsStateNotification(_:)),
+            name: .kivoIslandSettingsStateDidChange,
+            object: nil
+        )
+
+        // Observe dock state changed notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDockStateNotification(_:)),
+            name: .kivoIslandDockStateDidChange,
+            object: nil
+        )
+
+        // Observe dynamic height update notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleHeightUpdateNotification),
+            name: .kivoIslandHeightShouldUpdate,
+            object: nil
+        )
+
+        // Observe request expand notification
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRequestExpandNotification(_:)),
+            name: .kivoIslandRequestExpand,
+            object: nil
+        )
+
+        // Observe config change from UserDefaults
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleUserDefaultsChange),
+            name: UserDefaults.didChangeNotification,
+            object: nil
+        )
+
+        // Run once initially to apply settings
+        handleUserDefaultsChange()
+    }
+
+    @objc @MainActor private func handleRequestExpandNotification(_ notification: Notification) {
+        islandState.selectedTab = .home
+        islandState.isShowingSettings = false
+        
+        cancelPendingCollapse()
+        expand()
+    }
+
+    @objc @MainActor private func handleCollapseNotification() {
+        collapse()
+    }
+
+    private func targetHeightForCurrentState(isExpanding: Bool = false) -> CGFloat {
+        if !islandState.isExpanded && !isExpanding {
+            return Self.collapsedHeight
+        }
+        if islandState.isShowingSettings {
+            switch islandState.currentSettingsScreen {
+            case .main:
+                return 400
+            case .voice:
+                return 280
+            case .shortcuts:
+                return 320
+            }
+        }
+        switch islandState.selectedTab {
+        case .home:
+            let isTTSReady = KokoroTTSModelManager.shared.isModelReady
+            let isSTTReady = SherpaOnnxModelManager.shared.isModelReady
+            let isCheckingSTT = SherpaOnnxModelManager.shared.isCheckingCache
+
+            if (isTTSReady && isSTTReady) || isCheckingSTT {
+                return 215
+            } else {
+                return 275
+            }
+        case .agents:
+            if AgentManager.shared.activeTasks.isEmpty {
+                return 155
+            } else {
+                return Self.expandedHeight
+            }
+        }
+    }
+
+    @objc @MainActor private func handleHeightUpdateNotification() {
+        guard islandState.isExpanded, !isTransitioning else { return }
+
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let targetHeight = targetHeightForCurrentState()
+        let newFrame = resizeFrame(height: targetHeight, on: screen)
+
+        isTransitioning = true
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.35
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
+            self.islandPanel?.animator().setFrame(newFrame, display: true)
+        } completionHandler: {
+            Task { @MainActor [weak self] in
+                self?.isTransitioning = false
+            }
+        }
+    }
+
+    @objc @MainActor private func handleSettingsStateNotification(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let isShowing = userInfo["isShowing"] as? Bool else { return }
+
+        // Update state
+        islandState.isShowingSettings = isShowing
+        islandState.currentSettingsScreen = .main
+
+        // If not expanded, expand now (this shouldn't happen, but just in case)
+        if !islandState.isExpanded {
+            expand()
+            return
+        }
+
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        let targetHeight = targetHeightForCurrentState()
+        let newFrame = resizeFrame(height: targetHeight, on: screen)
+
+        isTransitioning = true
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.38
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
+            self.islandPanel?.animator().setFrame(newFrame, display: true)
+        } completionHandler: {
+            Task { @MainActor [weak self] in
+                self?.isTransitioning = false
+            }
+        }
+    }
+
+    @objc @MainActor private func handleDockStateNotification(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let isUndocked = userInfo["isUndocked"] as? Bool else { return }
+
+        islandState.isUndocked = isUndocked
+        islandPanel?.isMovableByWindowBackground = isUndocked
+
+        if !isUndocked {
+            // Animate back to top-center of screen
+            let screen = NSScreen.main ?? NSScreen.screens[0]
+            let targetHeight = targetHeightForCurrentState()
+            let dockedFrame = resizeFrame(height: targetHeight, on: screen)
+
+            isTransitioning = true
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.35
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
+                self.islandPanel?.animator().setFrame(dockedFrame, display: true)
+            } completionHandler: {
+                Task { @MainActor [weak self] in
+                    self?.isTransitioning = false
+                }
+            }
+        }
+    }
+
+    @objc @MainActor private func handleUserDefaultsChange() {
+        let showInDock = UserDefaults.standard.bool(forKey: "showInDock")
+        let showInScreenRecordings = UserDefaults.standard.object(forKey: "showInScreenRecordings") as? Bool ?? true
+
+        // Update Dock Activation Policy
+        let currentPolicy = NSApp.activationPolicy()
+        let targetPolicy: NSApplication.ActivationPolicy = showInDock ? .regular : .accessory
+        if currentPolicy != targetPolicy {
+            NSApp.setActivationPolicy(targetPolicy)
+        }
+
+        // Update Window Sharing Type
+        let targetSharingType: NSWindow.SharingType = showInScreenRecordings ? .readWrite : .readOnly
+        if islandPanel?.sharingType != targetSharingType {
+            islandPanel?.sharingType = targetSharingType
+        }
     }
 
     // MARK: - Panel Setup
@@ -85,11 +284,9 @@ final class KivoDynamicIslandManager: NSObject {
         )
 
         let hostingView = KivoDynamicIslandHostingView(rootView: rootView)
-        // The hosting view is sized to the MAXIMUM (expanded) dimensions from the start.
-        // The window acts as a clipping viewport. This prevents tracking area
-        // reinstallation on resize which causes the expand/collapse loop.
-        hostingView.frame = NSRect(origin: .zero, size: CGSize(width: Self.expandedWidth, height: Self.expandedHeight))
-        // Never auto-resize: the viewport (window) resizes, not the content.
+        // Use settingsHeight (the maximum possible height) for the hosting view.
+        // The window acts as a clipping viewport, preventing resizing/rendering loops.
+        hostingView.frame = NSRect(origin: .zero, size: CGSize(width: Self.expandedWidth, height: Self.settingsHeight))
         hostingView.autoresizingMask = []
         hostingView.islandManager = self
 
@@ -97,42 +294,82 @@ final class KivoDynamicIslandManager: NSObject {
         panel.orderFrontRegardless()
         self.islandPanel = panel
 
-        // Start at collapsed frame (the viewport is narrow/short initially).
+        // Start at collapsed frame
         panel.setFrame(collapsedFrame(on: screen), display: false)
+    }
+
+    // MARK: - Hover / Click Actions
+
+    func startHoverExpand() {
+        collapseTask?.cancel()
+        collapseTask = nil
+
+        guard !islandState.isExpanded, !isTransitioning else { return }
+
+        expandTask?.cancel()
+        expandTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: expandDelay)
+                guard !Task.isCancelled else { return }
+                self.expand()
+            } catch {}
+        }
+    }
+
+    func startHoverCollapse() {
+        expandTask?.cancel()
+        expandTask = nil
+
+        guard islandState.isExpanded, !isTransitioning, !islandState.isUndocked else { return }
+
+        collapseTask?.cancel()
+        collapseTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: collapseDelay)
+                guard !Task.isCancelled else { return }
+                self.collapse()
+            } catch {}
+        }
+    }
+
+    func cancelPendingCollapse() {
+        collapseTask?.cancel()
+        collapseTask = nil
+    }
+
+    func expandImmediately() {
+        expandTask?.cancel()
+        expandTask = nil
+        expand()
     }
 
     // MARK: - Expand
 
     func expand() {
-        // Bail if already expanded or mid-transition
         guard !islandState.isExpanded, !isTransitioning else { return }
 
-        // Cancel any pending collapse
-        collapseWorkItem?.cancel()
-        collapseWorkItem = nil
+        collapseTask?.cancel()
+        collapseTask = nil
 
         let screen = NSScreen.main ?? NSScreen.screens[0]
         isTransitioning = true
 
-        // Step 1: Immediately widen the window (the clip viewport) so the
-        // expanded content can render without SwiftUI clipping it.
+        let targetHeight = self.targetHeightForCurrentState(isExpanding: true)
+        let targetFrame = self.resizeFrame(height: targetHeight, on: screen)
+
+        // Single-stage fluid expansion
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.42
-            // A slightly spring-like ease-out cubic
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
-            self.islandPanel?.animator().setFrame(self.expandedFrame(on: screen), display: true)
-        } completionHandler: {
+            ctx.duration = 0.35
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.3, 1.0)
+            self.islandPanel?.animator().setFrame(targetFrame, display: true)
+        } completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
                 self?.isTransitioning = false
             }
         }
 
-        // Step 2: Trigger SwiftUI content swap with a short delay so the
-        // window is already growing before the content cross-fades in.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            withAnimation(.smooth(duration: 0.30)) {
-                self?.islandState.isExpanded = true
-            }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+            self.islandState.isExpanded = true
         }
     }
 
@@ -141,52 +378,46 @@ final class KivoDynamicIslandManager: NSObject {
     func collapse() {
         guard islandState.isExpanded, !isTransitioning else { return }
 
-        collapseWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
+        collapseTask?.cancel()
+        collapseTask = nil
+
+        let screen = NSScreen.main ?? NSScreen.screens[0]
+        isTransitioning = true
+
+        // Reset settings and dock state on collapse
+        self.islandState.isShowingSettings = false
+        self.islandState.isUndocked = false
+        self.islandPanel?.isMovableByWindowBackground = false
+
+        // Step 1: Fade out SwiftUI content immediately
+        withAnimation(.easeOut(duration: 0.12)) {
+            self.islandState.isExpanded = false
+        }
+
+        // Step 2: Shrink the window after content has faded
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                guard self.islandState.isExpanded, !self.isTransitioning else { return }
-
-                // Safety: verify mouse is actually outside the expanded panel
-                if let panel = self.islandPanel,
-                   panel.frame.contains(NSEvent.mouseLocation) { return }
-
-                let screen = NSScreen.main ?? NSScreen.screens[0]
-                self.isTransitioning = true
-
-                // Step 1: Fade out SwiftUI content immediately
-                withAnimation(.easeOut(duration: 0.18)) {
-                    self.islandState.isExpanded = false
+                guard let self = self, !self.islandState.isExpanded else {
+                    self?.isTransitioning = false
+                    return
                 }
-
-                // Step 2: Shrink the window after content has faded
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
-                    guard let self, !self.islandState.isExpanded else {
+                let screen = NSScreen.main ?? NSScreen.screens[0]
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.30
+                    // Smooth deceleration curve for collapse
+                    ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.65, 0, 0.35, 1)
+                    self.islandPanel?.animator().setFrame(self.collapsedFrame(on: screen), display: true)
+                } completionHandler: {
+                    Task { @MainActor [weak self] in
                         self?.isTransitioning = false
-                        return
-                    }
-                    NSAnimationContext.runAnimationGroup { ctx in
-                        ctx.duration = 0.28
-                        ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0.0, 0.2, 1.0)
-                        self.islandPanel?.animator().setFrame(self.collapsedFrame(on: screen), display: true)
-                    } completionHandler: {
-                        Task { @MainActor [weak self] in
-                            self?.isTransitioning = false
-                        }
                     }
                 }
             }
         }
-        collapseWorkItem = workItem
-        // 0.15s debounce before collapsing — ignores transient mouseExit events
-        // that fire during the expand resize itself.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
     }
 
     // MARK: - Frame Calculations
 
-    /// The collapsed pill sits at the top of the screen, horizontally centered.
-    /// Its y-anchor is the top of the screen (screen.maxY in AppKit coords).
     private func collapsedFrame(on screen: NSScreen) -> NSRect {
         let sf = screen.frame
         let x = sf.midX - Self.collapsedWidth / 2
@@ -194,12 +425,11 @@ final class KivoDynamicIslandManager: NSObject {
         return NSRect(x: x, y: y, width: Self.collapsedWidth, height: Self.collapsedHeight)
     }
 
-    /// The expanded panel grows downward from the same top anchor.
-    private func expandedFrame(on screen: NSScreen) -> NSRect {
+    private func resizeFrame(height: CGFloat, on screen: NSScreen) -> NSRect {
         let sf = screen.frame
         let x = sf.midX - Self.expandedWidth / 2
-        let y = sf.maxY - Self.expandedHeight
-        return NSRect(x: x, y: y, width: Self.expandedWidth, height: Self.expandedHeight)
+        let y = sf.maxY - height
+        return NSRect(x: x, y: y, width: Self.expandedWidth, height: height)
     }
 }
 
@@ -211,11 +441,6 @@ private final class KeyableIslandPanel: NSPanel {
 
 // MARK: - KivoDynamicIslandHostingView
 
-/// NSHostingView subclass with a STATIC tracking area.
-/// The key insight: the tracking area is installed ONCE on the full expanded
-/// rect and never reinstalled during window resizes. This prevents the
-/// mouseEntered/mouseExited loop that occurs when tracking areas are
-/// reinstalled on every bounds change during a size animation.
 final class KivoDynamicIslandHostingView: NSHostingView<KivoDynamicIslandView> {
 
     weak var islandManager: KivoDynamicIslandManager?
@@ -229,10 +454,6 @@ final class KivoDynamicIslandHostingView: NSHostingView<KivoDynamicIslandView> {
         installStaticTrackingArea()
     }
 
-    /// Installs a single tracking area covering the full hosting view bounds.
-    /// Called only once (when the view first attaches to the window).
-    /// We deliberately do NOT override updateTrackingAreas() to prevent
-    /// reinstallation during frame animations.
     private func installStaticTrackingArea() {
         if let old = hoverArea {
             removeTrackingArea(old)
@@ -248,6 +469,20 @@ final class KivoDynamicIslandHostingView: NSHostingView<KivoDynamicIslandView> {
         hoverArea = area
     }
 
-    override func mouseEntered(with event: NSEvent) { islandManager?.expand() }
-    override func mouseExited(with event: NSEvent)  { islandManager?.collapse() }
+    override func mouseEntered(with event: NSEvent) {
+        islandManager?.startHoverExpand()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        islandManager?.startHoverCollapse()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if let manager = islandManager, !manager.islandState.isExpanded {
+            // Cancel hover delay timer and expand immediately on click
+            manager.expandImmediately()
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
 }

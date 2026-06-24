@@ -25,4 +25,16 @@ enum AppBundleConfiguration {
         let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedValue.isEmpty ? nil : trimmedValue
     }
+
+    static var workerProxyURL: String {
+        return stringValue(forKey: "WorkerProxyURL") ?? "http://localhost:8787"
+    }
+
+    static var postHogAPIKey: String {
+        return stringValue(forKey: "PostHogAPIKey") ?? "phc_xcQPygmhTMzzYh8wNW92CCwoXmnzqyChAixh8zgpqC3C"
+    }
+
+    static var postHogHost: String {
+        return stringValue(forKey: "PostHogHost") ?? "https://us.i.posthog.com"
+    }
 }

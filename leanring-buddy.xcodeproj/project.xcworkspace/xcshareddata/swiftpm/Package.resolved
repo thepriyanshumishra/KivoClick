@@ -1,5 +1,5 @@
 {
-  "originHash" : "87c210255b5813eea7c037482c68a74913a449f04b351130084611e7482c5019",
+  "originHash" : "bd772ebedd8c75ed9d434b271c2417751dd25233a3508b443a2fb70c20fffac8",
   "pins" : [
     {
       "identity" : "plcrashreporter",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "09da1be6a614325a6a464c6d2017a9ac858d1b5a",
         "version" : "3.47.0"
+      }
+    },
+    {
+      "identity" : "sherpa-onnx-spm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/willwade/sherpa-onnx-spm.git",
+      "state" : {
+        "revision" : "45fc962cfd0a47f389434616de4d3d212c764c9f",
+        "version" : "1.13.16"
       }
     },
     {

@@ -8,9 +8,11 @@
 //
 
 import AppKit
+import AVFoundation
 import Combine
 import CoreGraphics
 import Foundation
+
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
@@ -121,9 +123,14 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             break
         case .pressed:
             isShortcutCurrentlyPressed = true
+            // Play the activation sound so the user knows Kivo is now listening.
+            // Dispatched async to main to avoid blocking the CGEvent tap callback.
+            DispatchQueue.main.async { KivoSoundFeedback.playActivation() }
             shortcutTransitionPublisher.send(.pressed)
         case .released:
             isShortcutCurrentlyPressed = false
+            // A subtle tick confirms the key was released and recording stopped.
+            DispatchQueue.main.async { KivoSoundFeedback.playDeactivation() }
             shortcutTransitionPublisher.send(.released)
         }
 

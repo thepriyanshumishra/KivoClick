@@ -49,6 +49,10 @@ class ElementLocationDetector {
         self.session = URLSession(configuration: config)
     }
 
+    deinit {
+        session.invalidateAndCancel()
+    }
+
     /// Detects the screen location of a UI element the user is asking about.
     ///
     /// - Parameters:

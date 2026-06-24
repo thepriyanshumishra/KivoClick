@@ -15,8 +15,8 @@ enum ClickyAnalytics {
 
     static func configure() {
         let config = PostHogConfig(
-            apiKey: "phc_xcQPygmhTMzzYh8wNW92CCwoXmnzqyChAixh8zgpqC3C",
-            host: "https://us.i.posthog.com"
+            apiKey: AppBundleConfiguration.postHogAPIKey,
+            host: AppBundleConfiguration.postHogHost
         )
         PostHogSDK.shared.setup(config)
     }

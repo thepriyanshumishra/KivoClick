@@ -41,15 +41,13 @@ final class SherpaOnnxTranscriptionProvider: BuddyTranscriptionProvider {
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
-        guard isConfigured,
-              let whisperKit = SherpaOnnxModelManager.shared.whisperKit else {
+        guard isConfigured else {
             throw SherpaOnnxTranscriptionError(
                 message: "WhisperKit model not ready. Please wait for download to complete."
             )
         }
 
         return SherpaOnnxTranscriptionSession(
-            whisperKit: whisperKit,
             onTranscriptUpdate: onTranscriptUpdate,
             onFinalTranscriptReady: onFinalTranscriptReady,
             onError: onError
@@ -62,6 +60,7 @@ final class SherpaOnnxTranscriptionProvider: BuddyTranscriptionProvider {
 /// One push-to-talk recording session. Buffers audio as Float32 samples,
 /// runs VAD-based chunked transcription during recording, and delivers a
 /// final concatenated transcript when the user releases the push-to-talk button.
+@MainActor
 private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionSession {
     /// How long to wait after the last audio buffer before the session is considered timed out.
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 6.0
@@ -90,8 +89,6 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
 
     // MARK: - State
 
-    private let stateQueue = DispatchQueue(label: "com.kivoclicks.whisperkit.session")
-
     /// Audio samples buffered for the current VAD chunk (Float32, 16kHz mono).
     private var currentChunkFloat32Samples: [Float] = []
 
@@ -106,7 +103,6 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
     private var isCancelled = false
     private var activeTranscriptionTask: Task<Void, Never>?
 
-    private let whisperKit: WhisperKit
     private let onTranscriptUpdate: (String) -> Void
     private let onFinalTranscriptReady: (String) -> Void
     private let onError: (Error) -> Void
@@ -118,12 +114,10 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
     // MARK: - Init
 
     init(
-        whisperKit: WhisperKit,
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) {
-        self.whisperKit = whisperKit
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
         self.onError = onError
@@ -138,67 +132,60 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
 
         let rmsEnergy = computeRMSEnergy(of: float32Samples)
 
-        stateQueue.async {
-            guard !self.hasRequestedFinalTranscript, !self.isCancelled else { return }
+        guard !self.hasRequestedFinalTranscript, !self.isCancelled else { return }
 
-            self.currentChunkFloat32Samples.append(contentsOf: float32Samples)
+        self.currentChunkFloat32Samples.append(contentsOf: float32Samples)
 
-            // VAD: track consecutive silent buffers
-            if rmsEnergy < Self.vadSilenceEnergyThreshold {
-                self.consecutiveSilentBufferCount += 1
-            } else {
-                self.consecutiveSilentBufferCount = 0
-            }
+        // VAD: track consecutive silent buffers
+        if rmsEnergy < Self.vadSilenceEnergyThreshold {
+            self.consecutiveSilentBufferCount += 1
+        } else {
+            self.consecutiveSilentBufferCount = 0
+        }
 
-            let chunkDurationSeconds = Double(self.currentChunkFloat32Samples.count) / Self.targetSampleRate
-            let silenceTriggered = self.consecutiveSilentBufferCount >= Self.vadSilentBufferCountTrigger
-            let maxDurationTriggered = chunkDurationSeconds >= Self.vadMaxChunkDurationSeconds
-            let hasEnoughAudioToTranscribe = chunkDurationSeconds >= Self.minimumChunkDurationSeconds
+        let chunkDurationSeconds = Double(self.currentChunkFloat32Samples.count) / Self.targetSampleRate
+        let silenceTriggered = self.consecutiveSilentBufferCount >= Self.vadSilentBufferCountTrigger
+        let maxDurationTriggered = chunkDurationSeconds >= Self.vadMaxChunkDurationSeconds
+        let hasEnoughAudioToTranscribe = chunkDurationSeconds >= Self.minimumChunkDurationSeconds
 
-            if hasEnoughAudioToTranscribe && (silenceTriggered || maxDurationTriggered) {
-                let chunkSamplesToTranscribe = self.currentChunkFloat32Samples
-                self.currentChunkFloat32Samples = []
-                self.consecutiveSilentBufferCount = 0
-                self.currentChunkStartTime = Date()
+        if hasEnoughAudioToTranscribe && (silenceTriggered || maxDurationTriggered) {
+            let chunkSamplesToTranscribe = self.currentChunkFloat32Samples
+            self.currentChunkFloat32Samples = []
+            self.consecutiveSilentBufferCount = 0
+            self.currentChunkStartTime = Date()
 
-                self.activeTranscriptionTask = Task { [weak self] in
-                    await self?.transcribeChunkAndAppend(chunkSamplesToTranscribe)
-                }
+            self.activeTranscriptionTask = Task { [weak self] in
+                await self?.transcribeChunkAndAppend(chunkSamplesToTranscribe)
             }
         }
     }
 
     func requestFinalTranscript() {
-        stateQueue.async {
-            guard !self.hasRequestedFinalTranscript, !self.isCancelled else { return }
-            self.hasRequestedFinalTranscript = true
+        guard !self.hasRequestedFinalTranscript, !self.isCancelled else { return }
+        self.hasRequestedFinalTranscript = true
 
-            // Cancel in-flight VAD chunk task to avoid racing with final transcript
-            self.activeTranscriptionTask?.cancel()
+        // Cancel in-flight VAD chunk task to avoid racing with final transcript
+        self.activeTranscriptionTask?.cancel()
 
-            let remainingSamples = self.currentChunkFloat32Samples
-            self.currentChunkFloat32Samples = []
+        let remainingSamples = self.currentChunkFloat32Samples
+        self.currentChunkFloat32Samples = []
 
-            self.activeTranscriptionTask = Task { [weak self] in
-                guard let self else { return }
+        self.activeTranscriptionTask = Task { [weak self] in
+            guard let self else { return }
 
-                // Transcribe any remaining buffered audio
-                if !remainingSamples.isEmpty {
-                    await self.transcribeChunkAndAppend(remainingSamples)
-                }
-
-                let finalText = self.stateQueue.sync { self.accumulatedTranscriptText }
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                self.deliverFinalTranscriptIfNeeded(finalText)
+            // Transcribe any remaining buffered audio
+            if !remainingSamples.isEmpty {
+                await self.transcribeChunkAndAppend(remainingSamples)
             }
+
+            let finalText = self.accumulatedTranscriptText.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.deliverFinalTranscriptIfNeeded(finalText)
         }
     }
 
     func cancel() {
-        stateQueue.sync {
-            isCancelled = true
-            currentChunkFloat32Samples.removeAll(keepingCapacity: false)
-        }
+        isCancelled = true
+        currentChunkFloat32Samples.removeAll(keepingCapacity: false)
         activeTranscriptionTask?.cancel()
     }
 
@@ -208,7 +195,7 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
     /// result to the accumulated transcript, firing onTranscriptUpdate immediately.
     private func transcribeChunkAndAppend(_ float32Samples: [Float]) async {
         guard !Task.isCancelled else { return }
-        guard !stateQueue.sync(execute: { isCancelled }) else { return }
+        guard !isCancelled else { return }
         guard !float32Samples.isEmpty else { return }
 
         do {
@@ -224,6 +211,11 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
                 withoutTimestamps: true
             )
 
+            guard let whisperKit = await MainActor.run(body: { SherpaOnnxModelManager.shared.whisperKit }) else {
+                print("🎙️ WhisperKit: ⚠️ Model reference not found in manager.")
+                return
+            }
+
             let transcriptionResults = try await whisperKit.transcribe(
                 audioArray: float32Samples,
                 decodeOptions: decodingOptions
@@ -235,19 +227,15 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             guard !chunkText.isEmpty else { return }
-            guard !Task.isCancelled, !stateQueue.sync(execute: { isCancelled }) else { return }
+            guard !Task.isCancelled, !isCancelled else { return }
 
-            stateQueue.async {
-                if !self.accumulatedTranscriptText.isEmpty {
-                    self.accumulatedTranscriptText += " "
-                }
-                self.accumulatedTranscriptText += chunkText
-
-                let currentFullTranscript = self.accumulatedTranscriptText
-                DispatchQueue.main.async {
-                    self.onTranscriptUpdate(currentFullTranscript)
-                }
+            if !self.accumulatedTranscriptText.isEmpty {
+                self.accumulatedTranscriptText += " "
             }
+            self.accumulatedTranscriptText += chunkText
+
+            let currentFullTranscript = self.accumulatedTranscriptText
+            self.onTranscriptUpdate(currentFullTranscript)
 
             print("🎙️ WhisperKit: Chunk → \"\(chunkText)\"")
         } catch {
@@ -332,9 +320,7 @@ private final class SherpaOnnxTranscriptionSession: BuddyStreamingTranscriptionS
     private func deliverFinalTranscriptIfNeeded(_ transcriptText: String) {
         guard !hasDeliveredFinalTranscript else { return }
         hasDeliveredFinalTranscript = true
-        DispatchQueue.main.async {
-            self.onFinalTranscriptReady(transcriptText)
-        }
+        self.onFinalTranscriptReady(transcriptText)
     }
 
     deinit {

@@ -92,10 +92,37 @@ enum BuddyPushToTalkShortcut {
         case keyUp
     }
 
-    static let currentShortcutOption: ShortcutOption = .controlOption
+    static var currentShortcutOption: ShortcutOption {
+        get {
+            let val = UserDefaults.standard.integer(forKey: "pushToTalkShortcut")
+            switch val {
+            case 0: return .controlOption
+            case 1: return .shiftFunction
+            case 2: return .shiftControl
+            case 3: return .controlOptionSpace
+            case 4: return .shiftControlSpace
+            default: return .controlOption
+            }
+        }
+        set {
+            let val: Int
+            switch newValue {
+            case .controlOption: val = 0
+            case .shiftFunction: val = 1
+            case .shiftControl: val = 2
+            case .controlOptionSpace: val = 3
+            case .shiftControlSpace: val = 4
+            }
+            UserDefaults.standard.set(val, forKey: "pushToTalkShortcut")
+        }
+    }
     static let pushToTalkKeyCode: UInt16 = 49 // Space
-    static let pushToTalkDisplayText = currentShortcutOption.displayText
-    static let pushToTalkTooltipText = "push to talk (\(pushToTalkDisplayText))"
+    static var pushToTalkDisplayText: String {
+        currentShortcutOption.displayText
+    }
+    static var pushToTalkTooltipText: String {
+        "push to talk (\(pushToTalkDisplayText))"
+    }
 
     static func shortcutTransition(
         for event: NSEvent,

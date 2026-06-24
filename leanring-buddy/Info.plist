@@ -16,5 +16,11 @@
 	<string>Kivo Click needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Kivo Click uses speech recognition to transcribe your voice when you talk to it</string>
+	<key>WorkerProxyURL</key>
+	<string>http://localhost:8787</string>
+	<key>PostHogAPIKey</key>
+	<string>phc_xcQPygmhTMzzYh8wNW92CCwoXmnzqyChAixh8zgpqC3C</string>
+	<key>PostHogHost</key>
+	<string>https://us.i.posthog.com</string>
 </dict>
 </plist>

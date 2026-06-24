@@ -38,3 +38,11 @@ worker/.wrangler/
 .claude/
 coding-plans/
 releases/
+
+# IDE and backup files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.tmp

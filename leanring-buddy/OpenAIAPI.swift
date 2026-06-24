@@ -35,6 +35,10 @@ class OpenAIAPI {
         warmUpTLSConnection()
     }
 
+    deinit {
+        session.invalidateAndCancel()
+    }
+
     /// Sends a no-op HEAD request to the API host to establish and cache a TLS session.
     /// Failures are silently ignored — this is purely an optimization.
     private func warmUpTLSConnection() {

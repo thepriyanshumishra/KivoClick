@@ -70,7 +70,7 @@ final class BuddyPCM16AudioConverter {
 }
 
 enum BuddyWAVFileBuilder {
-    static func buildWAVData(
+    nonisolated static func buildWAVData(
         fromPCM16MonoAudio pcm16AudioData: Data,
         sampleRate: Int,
         channelCount: Int = 1,

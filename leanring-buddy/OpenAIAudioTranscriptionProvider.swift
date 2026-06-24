@@ -1,23 +1,37 @@
 //
-//  WhisperTranscriptionProvider.swift
+//  OpenAIAudioTranscriptionProvider.swift
 //  leanring-buddy
 //
-//  Cross-platform local/fallback Whisper transcription provider.
+//  AI transcription provider backed by OpenAI's audio transcription API.
 //
 
 import AVFoundation
 import Foundation
 
-struct WhisperTranscriptionProviderError: LocalizedError {
+struct OpenAIAudioTranscriptionProviderError: LocalizedError {
     let message: String
-    var errorDescription: String? { message }
+
+    var errorDescription: String? {
+        message
+    }
 }
 
-final class WhisperTranscriptionProvider: BuddyTranscriptionProvider {
-    let displayName = "Whisper"
+final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
+    private let apiKey = AppBundleConfiguration.stringValue(forKey: "OpenAIAPIKey")
+    private let modelName = AppBundleConfiguration.stringValue(forKey: "OpenAITranscriptionModel")
+        ?? "gpt-4o-transcribe"
+
+    let displayName = "OpenAI"
     let requiresSpeechRecognitionPermission = false
-    let isConfigured = true
-    let unavailableExplanation: String? = nil
+
+    var isConfigured: Bool {
+        apiKey != nil
+    }
+
+    var unavailableExplanation: String? {
+        guard !isConfigured else { return nil }
+        return "OpenAI transcription is not configured. Add OpenAIAPIKey to Info.plist."
+    }
 
     func startStreamingSession(
         keyterms: [String],
@@ -25,7 +39,15 @@ final class WhisperTranscriptionProvider: BuddyTranscriptionProvider {
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
-        return WhisperTranscriptionSession(
+        guard let apiKey else {
+            throw OpenAIAudioTranscriptionProviderError(
+                message: unavailableExplanation ?? "OpenAI transcription is not configured."
+            )
+        }
+
+        return OpenAIAudioTranscriptionSession(
+            apiKey: apiKey,
+            modelName: modelName,
             keyterms: keyterms,
             onTranscriptUpdate: onTranscriptUpdate,
             onFinalTranscriptReady: onFinalTranscriptReady,
@@ -34,25 +56,24 @@ final class WhisperTranscriptionProvider: BuddyTranscriptionProvider {
     }
 }
 
-private final class WhisperTranscriptionSession: BuddyStreamingTranscriptionSession {
+private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscriptionSession {
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 8.0
 
     private struct TranscriptionResponse: Decodable {
         let text: String
     }
 
-    private static let localWhisperURL = URL(string: "http://localhost:8080/v1/audio/transcriptions")!
-    private static var fallbackWorkerURL: URL {
-        return URL(string: "\(AppBundleConfiguration.workerProxyURL)/transcribe")!
-    }
+    private static let transcriptionURL = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
     private static let targetSampleRate = 16_000
 
+    private let apiKey: String
+    private let modelName: String
     private let keyterms: [String]
     private let onTranscriptUpdate: (String) -> Void
     private let onFinalTranscriptReady: (String) -> Void
     private let onError: (Error) -> Void
 
-    private let stateQueue = DispatchQueue(label: "com.learningbuddy.whisper.transcription")
+    private let stateQueue = DispatchQueue(label: "com.learningbuddy.openai.transcription")
     private let audioPCM16Converter = BuddyPCM16AudioConverter(
         targetSampleRate: Double(targetSampleRate)
     )
@@ -65,20 +86,24 @@ private final class WhisperTranscriptionSession: BuddyStreamingTranscriptionSess
     private var transcriptionUploadTask: Task<Void, Never>?
 
     init(
+        apiKey: String,
+        modelName: String,
         keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) {
+        self.apiKey = apiKey
+        self.modelName = modelName
         self.keyterms = keyterms
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
         self.onError = onError
 
         let urlSessionConfiguration = URLSessionConfiguration.default
-        urlSessionConfiguration.timeoutIntervalForRequest = 5 // Fast fail for local offline check
-        urlSessionConfiguration.timeoutIntervalForResource = 30
-        urlSessionConfiguration.waitsForConnectivity = false
+        urlSessionConfiguration.timeoutIntervalForRequest = 45
+        urlSessionConfiguration.timeoutIntervalForResource = 90
+        urlSessionConfiguration.waitsForConnectivity = true
         self.urlSession = URLSession(configuration: urlSessionConfiguration)
     }
 
@@ -133,64 +158,47 @@ private final class WhisperTranscriptionSession: BuddyStreamingTranscriptionSess
             sampleRate: Self.targetSampleRate
         )
 
-        // 1. Try Local Whisper Engine
         do {
-            print("🎙️ Whisper STT: Attempting local engine at \(Self.localWhisperURL)")
-            let transcriptText = try await requestTranscription(for: wavAudioData, url: Self.localWhisperURL, isLocal: true)
+            let transcriptText = try await requestTranscription(for: wavAudioData)
             guard !stateQueue.sync(execute: { isCancelled }) else { return }
 
-            print("🎙️ Whisper STT: Local engine transcription succeeded!")
             if !transcriptText.isEmpty {
                 onTranscriptUpdate(transcriptText)
             }
-            deliverFinalTranscript(transcriptText)
-            return
-        } catch {
-            print("🎙️ Whisper STT: ⚠️ Local transcription failed: \(error.localizedDescription). Falling back to Groq Whisper...")
-        }
 
-        // 2. Fallback to Groq Whisper via Cloudflare Worker Proxy
-        do {
-            let transcriptText = try await requestTranscription(for: wavAudioData, url: Self.fallbackWorkerURL, isLocal: false)
-            guard !stateQueue.sync(execute: { isCancelled }) else { return }
-
-            print("🎙️ Whisper STT: Fallback Groq transcription succeeded!")
-            if !transcriptText.isEmpty {
-                onTranscriptUpdate(transcriptText)
-            }
             deliverFinalTranscript(transcriptText)
         } catch {
             guard !stateQueue.sync(execute: { isCancelled }) else { return }
-            print("🎙️ Whisper STT: ❌ Fallback transcription failed: \(error.localizedDescription)")
+            print("[OpenAI Transcription] ❌ Upload failed (audio size: \(wavAudioData.count) bytes): \(error.localizedDescription)")
             onError(error)
         }
     }
 
-    private func requestTranscription(for wavAudioData: Data, url: URL, isLocal: Bool) async throws -> String {
+    private func requestTranscription(for wavAudioData: Data) async throws -> String {
         let multipartBoundary = "Boundary-\(UUID().uuidString)"
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: Self.transcriptionURL)
         request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(multipartBoundary)", forHTTPHeaderField: "Content-Type")
 
         let requestBodyData = makeMultipartRequestBody(
             boundary: multipartBoundary,
-            wavAudioData: wavAudioData,
-            isLocal: isLocal
+            wavAudioData: wavAudioData
         )
         request.httpBody = requestBodyData
 
         let (responseData, response) = try await urlSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw WhisperTranscriptionProviderError(
-                message: "Whisper transcription returned an invalid response."
+            throw OpenAIAudioTranscriptionProviderError(
+                message: "OpenAI transcription returned an invalid response."
             )
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let responseText = String(data: responseData, encoding: .utf8) ?? "Unknown error"
-            throw WhisperTranscriptionProviderError(
-                message: "Whisper transcription failed: \(responseText)"
+            throw OpenAIAudioTranscriptionProviderError(
+                message: "OpenAI transcription failed: \(responseText)"
             )
         }
 
@@ -208,28 +216,37 @@ private final class WhisperTranscriptionSession: BuddyStreamingTranscriptionSess
             return responseText
         }
 
-        throw WhisperTranscriptionProviderError(
-            message: "Whisper transcription returned an empty transcript."
+        throw OpenAIAudioTranscriptionProviderError(
+            message: "OpenAI transcription returned an empty transcript."
         )
     }
 
     private func makeMultipartRequestBody(
         boundary: String,
-        wavAudioData: Data,
-        isLocal: Bool
+        wavAudioData: Data
     ) -> Data {
         var requestBodyData = Data()
 
-        if isLocal {
+        requestBodyData.appendMultipartFormField(
+            named: "model",
+            value: modelName,
+            usingBoundary: boundary
+        )
+        requestBodyData.appendMultipartFormField(
+            named: "language",
+            value: "en",
+            usingBoundary: boundary
+        )
+        requestBodyData.appendMultipartFormField(
+            named: "response_format",
+            value: "json",
+            usingBoundary: boundary
+        )
+
+        if let contextualPrompt = transcriptionPromptText() {
             requestBodyData.appendMultipartFormField(
-                named: "response_format",
-                value: "json",
-                usingBoundary: boundary
-            )
-        } else {
-            requestBodyData.appendMultipartFormField(
-                named: "model",
-                value: "whisper-large-v3-turbo",
+                named: "prompt",
+                value: contextualPrompt,
                 usingBoundary: boundary
             )
         }
@@ -244,6 +261,18 @@ private final class WhisperTranscriptionSession: BuddyStreamingTranscriptionSess
         requestBodyData.appendString("--\(boundary)--\r\n")
 
         return requestBodyData
+    }
+
+    private func transcriptionPromptText() -> String? {
+        let normalizedKeyterms = keyterms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !normalizedKeyterms.isEmpty else { return nil }
+
+        return """
+        This is a short push-to-talk transcript for a coding and product app. Expect product names, technical terms, and app-specific vocabulary such as: \(normalizedKeyterms.joined(separator: ", ")).
+        """
     }
 
     private func deliverFinalTranscript(_ transcriptText: String) {
